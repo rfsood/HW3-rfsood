@@ -1,0 +1,126 @@
+Ravi Sood
+March 13, 2014
+BIOST 578A
+Homework 3
+========================================================
+
+1. Get the data from GEO. Note: used code from class notes.
+```{r}
+# Load necessary packages
+library(GEOquery)
+library(limma)
+library(data.table)
+library(pheatmap)
+library(GSEABase)
+
+# Download the supplementary files
+getGEOSuppFiles("GSE45735", makeDirectory=FALSE, baseDir = "Data/GEO/")
+
+# Note: prior to using read.table, manually unzipped the text files and removed extraneous rows from T14 txt file
+files <- list.files(path = "Data/GEO/", pattern = "GSE45735_T.*.txt", full.names = TRUE)
+file_list <- lapply(files, read.table, header=TRUE)
+
+# Remove duplicated rows
+file_list_unique <- lapply(file_list, function(x){x<-x[!duplicated(x$Gene),]; 
+                                                  x <- x[order(x$Gene),]; 
+                                                  rownames(x) <- x$Gene;
+                                                  x[,-1]})
+
+# Take the intersection of all genes
+gene_list <- Reduce(intersect, lapply(file_list_unique, rownames))
+file_list_unique <- lapply(file_list_unique, "[", gene_list,)
+matrix <- as.matrix(do.call(cbind, file_list_unique))
+
+# Obtain the pData from GEO
+gd <- getGEO("GSE45735", destdir = "Data/GEO/")
+pd <- pData(gd[[1]])
+
+# Clean up the pData
+pd_small <- pd[!grepl("T13_Day8",pd$title),] # Remove row corresponding to T13 Day8
+pd_small$day <- sapply(strsplit(gsub(" \\[PBMC\\]", "", pd_small$title),"_"),"[",2) # Create column for "day"
+pd_small$subject <- sapply(strsplit(gsub(" \\[PBMC\\]", "", pd_small$title),"_"),"[",1) # Create column for "subject"
+colnames(matrix) <- rownames(pd_small)
+```
+
+2. Use voom and limma to find genes that are differentially expressed at each time point compared to baseline (day 0). Use an FDR cutoff of 0.01. Display your results using pheatmap showing the log fold-change of the differentially expressed genes grouped by time point.
+```{r}
+# Create ExpressionSet
+eset_hw3 <- ExpressionSet(assayData = matrix+1)
+pData(eset_hw3) <- pd_small
+
+# Create design matrix
+design_hw3 <- model.matrix(~subject+day, eset_hw3)
+voom_hw3 <- voom(eset_hw3, design = design_hw3)
+
+# Fit linear model
+lm <- lmFit(voom_hw3, design_hw3)
+
+# Calculate empirical Bayes statistics 
+eb <- eBayes(lm)
+
+# Find DE genes (FDR = 0.01) at each timepoint and store as list of data tables whose list index corresponds to time point being compared to baseline
+FDR <- 0.01
+days <- 1:10
+tt_list <- vector("list", length(days))
+for (i in days) {
+  coef <- paste0("dayDay",i)
+  df <- topTable(eb, coef=coef, number=Inf, sort.by="none")
+  tt_list[[i]] <- as.data.table(df)
+  tt_list[[i]]$significant <- ifelse(tt_list[[i]]$adj.P.Val<FDR, "Yes", "No")
+  tt_list[[i]]$gene <- rownames(df)
+  setkey(tt_list[[i]], gene)
+}
+
+# Create variable indicating whether gene is differentially expressed at any time point
+tt_list[[1]]$anytime <- ifelse(tt_list[[1]]$significant=="Yes", "Yes", "No")
+for (i in days[-1]) {
+    tt_list[[1]]$anytime <- ifelse(tt_list[[1]]$significant=="No" & tt_list[[i]]$significant=="Yes", "Yes", tt_list[[1]]$anytime)
+}
+
+# Create data frame of logFC values relative to day 0 at each time point
+setnames(tt_list[[1]],"logFC","Day 1")
+hm_dt <- tt_list[[1]][, c("AveExpr","t","P.Value","adj.P.Val","B","significant"):=NULL]
+for (i in 2:length(days)) {
+  setnames(tt_list[[i]], "logFC", paste("Day",i))
+  tt_list[[i]][, c("AveExpr","t","P.Value","adj.P.Val","B","significant"):=NULL]
+  hm_dt <- merge(hm_dt, tt_list[[i]], all.x=TRUE)
+}
+hm_df <- data.frame(hm_dt)
+rownames(hm_df) <- hm_dt$gene
+colnames(hm_df) <- colnames(hm_dt)
+
+# Delete rows corresponding to genes not differentially expressed at any time point
+hm_df <- hm_df[hm_df$anytime=="Yes",]
+
+# Delete extraneous columns and plot heatmap
+hm_df$gene <- NULL
+hm_df$anytime <- NULL
+hm_m <- data.matrix(hm_df)
+pheatmap(hm_m,cluster_cols=FALSE,scale="row") 
+```
+
+3. Perform a GSEA analysis using camera and the MSigDB Reactome pathway gene signatures. Display your results using pheatmap, again group by timepoint. This is similar to what we've done in class.
+```{r}
+# Obtain gene indices for camera [Note: first had to manually download MSigDB Reactome gene sets]
+c2_set_hw3 <- getGmt("GSEA Sets/c2.cp.reactome.v4.0.symbols.gmt")
+gene_ids_hw3 <- geneIds(c2_set_hw3)
+sets_indices_hw3 <- symbols2indices(gene_ids_hw3, rownames(eset_hw3))
+
+# Find enriched gene sets over time
+desets_list <- vector("list", length(days))
+subjects <- length(unique(pData(eset_hw3)$subject))
+for (i in days) {
+  cont <- paste0("dayDay",i)
+  cont_matrix <- makeContrasts(cont, levels=design_hw3)
+  desets_list[[i]] <- camera(voom_hw3, index=sets_indices_hw3, design=design_hw3, contrast=cont_matrix)
+}
+
+# Draw heatmap of enriched gene sets over time
+PValue <- sapply(desets_list, function(x){ifelse(x$Direction=="Up", -10*log10(x$PValue), 10*log10(x$PValue))})
+rownames(PValue) <- rownames(desets_list[[1]])
+PValue_max <- rowMax(abs(PValue))
+PValue_small <- PValue[PValue_max>30, ]
+anno <- data.frame(Time=paste0("Day",days))
+rownames(anno) <- colnames(PValue_small)  <- paste0("Day",days)
+pheatmap(PValue_small, cluster_cols=FALSE, scale="row")
+```
